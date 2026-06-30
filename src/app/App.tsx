@@ -18,7 +18,7 @@ L.Icon.Default.mergeOptions({
   shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
 });
 
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   Clock, Fingerprint, LogOut, LogIn, Users, Calendar, FileText,
   Settings, ChevronRight, Bell, Search, TrendingUp, AlertCircle, CheckCircle2,
@@ -411,149 +411,8 @@ function detectSpoofing(
 }
 
 /** Full GPS verification pipeline: multi-sample → smooth → anti-spoof → geofence */
-/** Full Production-Grade GPS Pipeline */
-/** Full Production-Grade GPS Pipeline */
-async function runGPSPipeline(
-  geofences: GeofenceZone[],
-  onProgress: (msg: string, accuracy: number, timeRem: number) => void,
-  maxWaitMs = 12000, // Give it 12 seconds to stabilize
-  signal?: AbortSignal
-): Promise<GPSVerificationResult> {
-  return new Promise((resolve) => {
-    const rawSamples: GeolocationPosition[] = [];
-    let watchId: number;
-    let startTime = Date.now();
-    let settledPosition: { lat: number, lng: number, accuracy: number } | null = null;
 
-    const finish = () => {
-      if (watchId) navigator.geolocation.clearWatch(watchId);
-      processResults();
-    };
 
-    const timeout = setTimeout(() => { finish(); }, maxWaitMs);
-
-    // ABORT CONTROLLER LISTENER: Immediately cancel the GPS pipeline if user clicks "Back"
-    if (signal) {
-      signal.addEventListener("abort", () => {
-        clearTimeout(timeout);
-        if (watchId) navigator.geolocation.clearWatch(watchId);
-        resolve(generateErrorResult("GPS acquisition cancelled by user."));
-      });
-    }
-
-    watchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        const elapsed = Date.now() - startTime;
-        
-        // 1. WARM-UP PHASE: Ignore the first 2 seconds of data entirely
-        if (elapsed < 2000) {
-            onProgress("Warming up GPS sensor...", pos.coords.accuracy, Math.max(0, (maxWaitMs - elapsed) / 1000));
-            return;
-        }
-
-        // 2. SPIKE REJECTION: Ignore terrible readings
-        if (pos.coords.accuracy > 100 && rawSamples.length > 0) return; 
-
-        rawSamples.push(pos);
-        const remaining = Math.max(0, (maxWaitMs / 1000) - (elapsed / 1000));
-        
-        onProgress("Acquiring precision lock...", pos.coords.accuracy, remaining);
-
-        // 3. EARLY EXIT: If we get a "Grab-level" lock (under 12 meters) with at least 3 samples
-        if (pos.coords.accuracy <= 12 && rawSamples.length >= 3) {
-          clearTimeout(timeout);
-          finish();
-        }
-      },
-      (err) => {
-        if (rawSamples.length === 0) {
-          clearTimeout(timeout);
-          if (watchId) navigator.geolocation.clearWatch(watchId);
-          resolve(generateErrorResult(
-              err.code === 1 ? "Location permission denied." : "GPS signal lost or unavailable."
-          ));
-        }
-      },
-      // Crucial Configuration for Production
-      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
-    );
-
-    function processResults() {
-      if (rawSamples.length === 0) {
-        resolve(generateErrorResult("Could not obtain a stable GPS lock. Please step outside."));
-        return;
-      }
-
-      // 4. WEIGHTED AVERAGE FILTER (Drift Reduction)
-      let totalWeight = 0;
-      let wLat = 0;
-      let wLng = 0;
-      let bestAccuracy = Infinity;
-
-      rawSamples.forEach(sample => {
-          const weight = 1 / Math.pow(sample.coords.accuracy, 2);
-          totalWeight += weight;
-          wLat += sample.coords.latitude * weight;
-          wLng += sample.coords.longitude * weight;
-          if (sample.coords.accuracy < bestAccuracy) bestAccuracy = sample.coords.accuracy;
-      });
-
-      settledPosition = {
-          lat: wLat / totalWeight,
-          lng: wLng / totalWeight,
-          accuracy: bestAccuracy
-      };
-
-      const latest = rawSamples[rawSamples.length - 1];
-      const accuracyScore = computeAccuracyScore(settledPosition.accuracy);
-      const { riskLevel, reasons: riskReasons } = detectSpoofing(rawSamples);
-
-      // 5. GEOFENCE VALIDATION WITH DYNAMIC HYSTERESIS BUFFER
-      const activeZones = geofences.filter(g => g.active);
-      let bestZone: GeofenceZone | null = null;
-      let bestDist = Infinity;
-
-      const dynamicBuffer = Math.min(settledPosition.accuracy * 0.6, 30); 
-
-      for (const zone of activeZones) {
-        const dist = haversineDistance(settledPosition.lat, settledPosition.lng, zone.lat, zone.lng);
-        if (dist < bestDist) { 
-          bestDist = dist; 
-          bestZone = zone; 
-        }
-        if (dist <= (zone.radius + dynamicBuffer)) { 
-          bestDist = dist; 
-          bestZone = zone; 
-          break;
-        }
-      }
-
-      const insideGeofence = bestZone !== null && bestDist <= (bestZone.radius + dynamicBuffer);
-      
-      const approved = settledPosition.accuracy <= 50 && insideGeofence && riskLevel !== "high";
-
-      resolve({
-        reading: { 
-          lat: settledPosition.lat, lng: settledPosition.lng, accuracy: settledPosition.accuracy,
-          speed: latest.coords.speed ?? null, heading: latest.coords.heading ?? null,
-          timestamp: latest.timestamp, source: "gps",
-        },
-        accuracyScore, riskLevel, riskReasons,
-        geofenceId: bestZone?.id ?? null, geofenceName: bestZone?.name ?? null,
-        distanceFromGeofence: bestZone ? Math.round(bestDist) : null,
-        insideGeofence, approved,
-      });
-    }
-
-    function generateErrorResult(msg: string): GPSVerificationResult {
-      return {
-        reading: { lat: 0, lng: 0, accuracy: 999, speed: null, heading: null, timestamp: Date.now(), source: "manual" },
-        accuracyScore: 0, riskLevel: "high", riskReasons: [msg],
-        geofenceId: null, geofenceName: null, distanceFromGeofence: null, insideGeofence: false, approved: false,
-      };
-    }
-  });
-}
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
@@ -1196,6 +1055,130 @@ function RiskBadge({ level }: { level: RiskLevel }) {
   );
 }
 
+//UsePrecisionLocation
+function usePrecisionLocation(maxWaitMs = 15000, requiredAccuracy = 20) {
+  const [state, setState] = useState<{
+    status: "idle" | "warming_up" | "acquiring" | "locked" | "error";
+    errorMsg: string | null;
+    lat: number | null;
+    lng: number | null;
+    accuracy: number;
+    readingsCount: number;
+  }>({
+    status: "idle",
+    errorMsg: null,
+    lat: null,
+    lng: null,
+    accuracy: 999,
+    readingsCount: 0,
+  });
+
+  const watchIdRef = useRef<number | null>(null);
+  const samplesRef = useRef<GeolocationPosition[]>([]);
+  const startTimeRef = useRef<number>(0);
+
+  const stopTracking = useCallback(() => {
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+  }, []);
+
+  const startTracking = useCallback(() => {
+    if (!navigator.geolocation) {
+      setState(prev => ({ ...prev, status: "error", errorMsg: "Geolocation not supported." }));
+      return;
+    }
+
+    setState({ status: "warming_up", errorMsg: null, lat: null, lng: null, accuracy: 999, readingsCount: 0 });
+    samplesRef.current = [];
+    startTimeRef.current = Date.now();
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const elapsed = Date.now() - startTimeRef.current;
+        const currentAccuracy = pos.coords.accuracy;
+
+        // 1. WARM-UP PHASE: Ignore the first 2 seconds entirely
+        if (elapsed < 2000) return;
+
+        // 2. SPIKE REJECTION: Reject terrible readings immediately
+        if (currentAccuracy > 100) return;
+
+        samplesRef.current.push(pos);
+        
+        // 3. WEIGHTED AVERAGE CALCULATION
+        let totalWeight = 0, wLat = 0, wLng = 0, bestAcc = Infinity;
+
+        samplesRef.current.forEach(sample => {
+          const weight = 1 / Math.pow(sample.coords.accuracy, 2);
+          totalWeight += weight;
+          wLat += sample.coords.latitude * weight;
+          wLng += sample.coords.longitude * weight;
+          if (sample.coords.accuracy < bestAcc) bestAcc = sample.coords.accuracy;
+        });
+
+        const averagedLat = wLat / totalWeight;
+        const averagedLng = wLng / totalWeight;
+
+        // 4. CHECK LOCK CONDITIONS
+        const hasEnoughSamples = samplesRef.current.length >= 4;
+        const isHighlyAccurate = bestAcc <= requiredAccuracy;
+        
+        if (hasEnoughSamples && isHighlyAccurate) {
+          stopTracking();
+          setState({
+            status: "locked",
+            errorMsg: null,
+            lat: averagedLat,
+            lng: averagedLng,
+            accuracy: bestAcc,
+            readingsCount: samplesRef.current.length,
+          });
+        } else {
+          setState({
+            status: "acquiring",
+            errorMsg: null,
+            lat: averagedLat,
+            lng: averagedLng,
+            accuracy: bestAcc,
+            readingsCount: samplesRef.current.length,
+          });
+        }
+      },
+      (err) => {
+        if (samplesRef.current.length === 0) {
+          stopTracking();
+          setState(prev => ({ 
+            ...prev, 
+            status: "error", 
+            errorMsg: err.code === 1 ? "Location permission denied." : "Lost GPS signal." 
+          }));
+        }
+      },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+    );
+
+    // 5. TIMEOUT: Force resolution after maxWaitMs
+    setTimeout(() => {
+      if (watchIdRef.current !== null) {
+        stopTracking();
+        if (samplesRef.current.length > 0) {
+           setState(prev => ({ ...prev, status: "locked" }));
+        } else {
+           setState(prev => ({ ...prev, status: "error", errorMsg: "Could not acquire stable location. Try turning on Wi-Fi or stepping outside." }));
+        }
+      }
+    }, maxWaitMs);
+
+  }, [maxWaitMs, requiredAccuracy, stopTracking]);
+
+  useEffect(() => {
+    return () => stopTracking();
+  }, [stopTracking]);
+
+  return { locationState: state, startTracking, stopTracking };
+}
 // ─── Function Force Check-In Gate ──────────────────────────────────────────────────────
 
 // ─── Force Check-In Gate ──────────────────────────────────────────────────────
@@ -1203,24 +1186,77 @@ function RiskBadge({ level }: { level: RiskLevel }) {
 function ForceCheckInGate({ user, geofences, onComplete }: { user: User; geofences: GeofenceZone[]; onComplete: (record: AttendanceRecord) => void; }) {
   const [step, setStep] = useState("auth");
   const [authMethod, setAuthMethod] = useState("");
-  const [gpsProgress, setGpsProgress] = useState({ msg: "Initializing GPS…", accuracy: 999, timeRem: 10 });
   const [gpsResult, setGpsResult] = useState<GPSVerificationResult | null>(null);
   const [result, setResult] = useState<{ timeIn: string; status: AttendanceStatus; method: string } | null>(null);
   const [phtNow, setPhtNow] = useState(new Date());
-  
-  const abortCtrlRef = useRef<AbortController | null>(null);
-  
+
+  // Use the new hook
+  const { locationState, startTracking, stopTracking } = usePrecisionLocation(12000, 20);
+
   useEffect(() => {
     const t = setInterval(() => setPhtNow(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
-  
+
+  // Watch for location state changes and perform Geofence Math when locked
+  useEffect(() => {
+    if (step !== "gps") return;
+
+    if (locationState.status === "locked" && locationState.lat !== null && locationState.lng !== null) {
+      const activeZones = geofences.filter(g => g.active);
+      let bestZone: GeofenceZone | null = null;
+      let bestDist = Infinity;
+
+      for (const zone of activeZones) {
+        const dist = haversineDistance(locationState.lat, locationState.lng, zone.lat, zone.lng);
+        if (dist < bestDist) { 
+          bestDist = dist; 
+          bestZone = zone; 
+        }
+      }
+
+      const insideGeofence = bestZone !== null && bestDist <= bestZone.radius;
+      
+      setGpsResult({
+        reading: { 
+          lat: locationState.lat, 
+          lng: locationState.lng, 
+          accuracy: locationState.accuracy, 
+          speed: null, 
+          heading: null, 
+          timestamp: Date.now(), 
+          source: "gps" 
+        },
+        accuracyScore: computeAccuracyScore(locationState.accuracy),
+        riskLevel: "low",
+        riskReasons: [],
+        geofenceId: bestZone?.id ?? null,
+        geofenceName: bestZone?.name ?? null,
+        distanceFromGeofence: bestZone ? Math.round(bestDist) : null,
+        insideGeofence,
+        approved: insideGeofence && locationState.accuracy <= 50,
+      });
+      setStep("geofence_result");
+
+    } else if (locationState.status === "error") {
+      setGpsResult({
+        reading: { lat: 0, lng: 0, accuracy: 999, speed: null, heading: null, timestamp: Date.now(), source: "manual" },
+        accuracyScore: 0, 
+        riskLevel: "high", 
+        riskReasons: [locationState.errorMsg || "GPS acquisition failed."],
+        geofenceId: null, geofenceName: null, distanceFromGeofence: null, 
+        insideGeofence: false, approved: false,
+      });
+      setStep("geofence_result");
+    }
+  }, [locationState, geofences, step]);
+
   const phtTime = fmtTimePHT(phtNow);
   const phtD = getPHTDate();
   const arrivalStatus = getArrivalStatus(phtD.getHours(), phtD.getMinutes());
   const statusColor: Record<string, string> = { Early: "text-sky-400", "On Time": "text-emerald-400", Late: "text-amber-400" };
 
-  async function onBiometricSuccess(method: string) {
+  function onBiometricSuccess(method: string) {
     setAuthMethod(method);
     if (method.includes("Simulated")) {
       setGpsResult({ ...DEMO_GPS });
@@ -1228,36 +1264,12 @@ function ForceCheckInGate({ user, geofences, onComplete }: { user: User; geofenc
       return;
     }
     setStep("gps");
-    setGpsProgress({ msg: "Requesting device GPS permission…", accuracy: 999, timeRem: 10 });
-    let gps: GPSVerificationResult;
-    
-    abortCtrlRef.current = new AbortController();
-    
-    try {
-      gps = await runGPSPipeline(
-        geofences,
-        (msg, accuracy, timeRem) => setGpsProgress({ msg, accuracy, timeRem }),
-        10000,
-        abortCtrlRef.current.signal
-      );
-      // If the user clicked "Back", abort the state updates
-      if (abortCtrlRef.current.signal.aborted) return;
-    } catch {
-      gps = {
-        reading: { lat: 0, lng: 0, accuracy: 999, speed: null, heading: null, timestamp: Date.now(), source: "manual" },
-        accuracyScore: 0, riskLevel: "high",
-        riskReasons: ["GPS pipeline error — browser may not support geolocation"],
-        geofenceId: null, geofenceName: null, distanceFromGeofence: null,
-        insideGeofence: false, approved: false,
-      };
-    }
-    setGpsResult(gps);
-    setStep("geofence_result");
+    startTracking();
   }
 
   function handleBack() {
     if (step === "gps") {
-      abortCtrlRef.current?.abort(); // Shut down the GPS tracker
+      stopTracking(); 
       setStep("auth");
     } else if (step === "geofence_result") {
       setStep("auth");
@@ -1278,6 +1290,7 @@ function ForceCheckInGate({ user, geofences, onComplete }: { user: User; geofenc
     const ua = navigator.userAgent;
     const browser = /Edg/.test(ua) ? "Edge" : /Chrome/.test(ua) ? "Chrome" : /Firefox/.test(ua) ? "Firefox" : /Safari/.test(ua) ? "Safari" : "Browser";
     const status = getArrivalStatus(now.getHours(), now.getMinutes());
+    
     const record: AttendanceRecord = {
       id: String(Date.now()), employeeId: user.employeeId, date: todayStrPHT(),
       timeIn, timeOut: null, totalHours: null, overtimeHours: 0, holidayHours: 0,
@@ -1285,6 +1298,7 @@ function ForceCheckInGate({ user, geofences, onComplete }: { user: User; geofenc
       authMethod, device: `${detectPlatform()} · ${browser}`, otStatus: null,
       gps: gpsResult ?? undefined,
     };
+    
     setResult({ timeIn, status, method: authMethod });
     setTimeout(() => {
       setStep("done");
@@ -1359,22 +1373,24 @@ function ForceCheckInGate({ user, geofences, onComplete }: { user: User; geofenc
                  </div>
                  <div>
                     <div className="text-sm font-bold">Acquiring Precision GPS</div>
-                    <div className="text-xs text-muted-foreground mt-1">{gpsProgress.msg}</div>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      {locationState.status === "warming_up" ? "Warming up GPS sensor..." : "Acquiring precision lock..."}
+                    </div>
                  </div>
               </div>
               <div className="bg-secondary/50 rounded-xl p-4 flex items-center justify-between">
                  <div className="text-xs font-semibold text-muted-foreground">Current Accuracy</div>
-                 <span className={`text-sm font-mono ${gpsProgress.accuracy <= 20 ? "text-emerald-400 font-bold" : gpsProgress.accuracy <= 65 ? "text-amber-400" : "text-red-400"}`}>
-                    {gpsProgress.accuracy < 999 ? `±${Math.round(gpsProgress.accuracy)}m` : "Calculating..."}
+                 <span className={`text-sm font-mono ${locationState.accuracy <= 20 ? "text-emerald-400 font-bold" : locationState.accuracy <= 65 ? "text-amber-400" : "text-red-400"}`}>
+                    {locationState.accuracy < 999 ? `±${Math.round(locationState.accuracy)}m` : "Calculating..."}
                  </span>
               </div>
               <div className="space-y-1.5">
                  <div className="flex justify-between text-[10px] font-mono text-muted-foreground">
                     <span>Filtering Signal</span>
-                    <span>{gpsProgress.timeRem}s remaining max</span>
+                    <span>Valid Samples: {locationState.readingsCount}</span>
                  </div>
                  <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
-                    <div className="bg-primary h-full rounded-full transition-all duration-1000 ease-linear" style={{ width: `${100 - ((gpsProgress.timeRem) / 10) * 100}%` }} />
+                    <div className="bg-primary h-full rounded-full transition-all duration-300 ease-linear" style={{ width: `${Math.min((locationState.readingsCount / 4) * 100, 100)}%` }} />
                  </div>
               </div>
               <div className="text-[10px] text-center text-muted-foreground max-w-[250px] mx-auto leading-relaxed">
@@ -1545,17 +1561,71 @@ function ForceCheckInGate({ user, geofences, onComplete }: { user: User; geofenc
 }
 
 // ─── Check-Out Modal ──────────────────────────────────────────────────────────
+// ─── Check-Out Modal ──────────────────────────────────────────────────────────
 
 function CheckOutModal({ user, geofences, todayRecord, onComplete, onClose }: { user: User; geofences: GeofenceZone[]; todayRecord: AttendanceRecord; onComplete: (updated: AttendanceRecord) => void; onClose: () => void; }) { 
   const [step, setStep] = useState<"auth" | "gps" | "geofence_result" | "saving" | "done">("auth");
   const [summary, setSummary] = useState<{ timeOut: string; totalHours: number; ot: number } | null>(null);
   const [authMethod, setAuthMethod] = useState("");
-  const [gpsProgress, setGpsProgress] = useState({ msg: "Initializing GPS…", accuracy: 999, timeRem: 10 });
   const [gpsResult, setGpsResult] = useState<GPSVerificationResult | null>(null);
 
-  const abortCtrlRef = useRef<AbortController | null>(null);
+  // Use the new high-precision location hook
+  const { locationState, startTracking, stopTracking } = usePrecisionLocation(12000, 20);
 
-  async function onBiometricSuccess(method: string) {
+  // Watch for location state changes and evaluate Geofence Math when locked
+  useEffect(() => {
+    if (step !== "gps") return;
+
+    if (locationState.status === "locked" && locationState.lat !== null && locationState.lng !== null) {
+      const activeZones = geofences.filter(g => g.active);
+      let bestZone: GeofenceZone | null = null;
+      let bestDist = Infinity;
+
+      for (const zone of activeZones) {
+        const dist = haversineDistance(locationState.lat, locationState.lng, zone.lat, zone.lng);
+        if (dist < bestDist) { 
+          bestDist = dist; 
+          bestZone = zone; 
+        }
+      }
+
+      const insideGeofence = bestZone !== null && bestDist <= bestZone.radius;
+      
+      setGpsResult({
+        reading: { 
+          lat: locationState.lat, 
+          lng: locationState.lng, 
+          accuracy: locationState.accuracy, 
+          speed: null, 
+          heading: null, 
+          timestamp: Date.now(), 
+          source: "gps" 
+        },
+        accuracyScore: computeAccuracyScore(locationState.accuracy),
+        riskLevel: "low",
+        riskReasons: [],
+        geofenceId: bestZone?.id ?? null,
+        geofenceName: bestZone?.name ?? null,
+        distanceFromGeofence: bestZone ? Math.round(bestDist) : null,
+        insideGeofence,
+        approved: insideGeofence && locationState.accuracy <= 50,
+      });
+      setStep("geofence_result");
+
+    } else if (locationState.status === "error") {
+      setGpsResult({
+        reading: { lat: 0, lng: 0, accuracy: 999, speed: null, heading: null, timestamp: Date.now(), source: "manual" },
+        accuracyScore: 0, 
+        riskLevel: "high", 
+        riskReasons: [locationState.errorMsg || "GPS acquisition failed."],
+        geofenceId: null, geofenceName: null, distanceFromGeofence: null, 
+        insideGeofence: false, approved: false,
+      });
+      setStep("geofence_result");
+    }
+  }, [locationState, geofences, step]);
+
+  function onBiometricSuccess(method: string) {
     setAuthMethod(method);
     if (method.includes("Simulated")) {
       setGpsResult({ ...DEMO_GPS });
@@ -1563,35 +1633,12 @@ function CheckOutModal({ user, geofences, todayRecord, onComplete, onClose }: { 
       return;
     }
     setStep("gps");
-    setGpsProgress({ msg: "Requesting device GPS permission…", accuracy: 999, timeRem: 10 });
-    let gps: GPSVerificationResult;
-    
-    abortCtrlRef.current = new AbortController();
-    
-    try {
-      gps = await runGPSPipeline(
-        geofences,
-        (msg, accuracy, timeRem) => setGpsProgress({ msg, accuracy, timeRem }),
-        10000,
-        abortCtrlRef.current.signal
-      );
-      if (abortCtrlRef.current.signal.aborted) return;
-    } catch {
-      gps = {
-        reading: { lat: 0, lng: 0, accuracy: 999, speed: null, heading: null, timestamp: Date.now(), source: "manual" },
-        accuracyScore: 0, riskLevel: "high",
-        riskReasons: ["GPS pipeline error — browser may not support geolocation"],
-        geofenceId: null, geofenceName: null, distanceFromGeofence: null,
-        insideGeofence: false, approved: false,
-      };
-    }
-    setGpsResult(gps);
-    setStep("geofence_result");
+    startTracking();
   }
 
   function handleBack() {
     if (step === "gps") {
-      abortCtrlRef.current?.abort();
+      stopTracking();
       setStep("auth");
     } else if (step === "geofence_result") {
       setStep("auth");
@@ -1658,22 +1705,24 @@ function CheckOutModal({ user, geofences, todayRecord, onComplete, onClose }: { 
                  </div>
                  <div>
                     <div className="text-sm font-bold">Acquiring Precision GPS</div>
-                    <div className="text-xs text-muted-foreground mt-1">{gpsProgress.msg}</div>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      {locationState.status === "warming_up" ? "Warming up GPS sensor..." : "Acquiring precision lock..."}
+                    </div>
                  </div>
               </div>
               <div className="bg-secondary/50 rounded-xl p-4 flex items-center justify-between">
                  <div className="text-xs font-semibold text-muted-foreground">Current Accuracy</div>
-                 <span className={`text-sm font-mono ${gpsProgress.accuracy <= 20 ? "text-emerald-400 font-bold" : gpsProgress.accuracy <= 65 ? "text-amber-400" : "text-red-400"}`}>
-                    {gpsProgress.accuracy < 999 ? `±${Math.round(gpsProgress.accuracy)}m` : "Calculating..."}
+                 <span className={`text-sm font-mono ${locationState.accuracy <= 20 ? "text-emerald-400 font-bold" : locationState.accuracy <= 65 ? "text-amber-400" : "text-red-400"}`}>
+                    {locationState.accuracy < 999 ? `±${Math.round(locationState.accuracy)}m` : "Calculating..."}
                  </span>
               </div>
               <div className="space-y-1.5">
                  <div className="flex justify-between text-[10px] font-mono text-muted-foreground">
                     <span>Filtering Signal</span>
-                    <span>{gpsProgress.timeRem}s remaining max</span>
+                    <span>Valid Samples: {locationState.readingsCount}</span>
                  </div>
                  <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
-                    <div className="bg-primary h-full rounded-full transition-all duration-1000 ease-linear" style={{ width: `${100 - ((gpsProgress.timeRem) / 10) * 100}%` }} />
+                    <div className="bg-primary h-full rounded-full transition-all duration-300 ease-linear" style={{ width: `${Math.min((locationState.readingsCount / 4) * 100, 100)}%` }} />
                  </div>
               </div>
               <div className="text-[10px] text-center text-muted-foreground max-w-[250px] mx-auto leading-relaxed">
@@ -1822,7 +1871,6 @@ function CheckOutModal({ user, geofences, todayRecord, onComplete, onClose }: { 
     </Modal>
   );
 }
-
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 type EmployeePage = "dashboard" | "checkout" | "history" | "schedule" | "profile";
