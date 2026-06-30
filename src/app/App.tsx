@@ -18,8 +18,7 @@ L.Icon.Default.mergeOptions({
   shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
 });
 
-
-import { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Clock, Fingerprint, LogOut, LogIn, Users, Calendar, FileText,
   Settings, ChevronRight, Bell, Search, TrendingUp, AlertCircle, CheckCircle2,
@@ -28,12 +27,10 @@ import {
   ThumbsUp, ThumbsDown, RefreshCw, ChevronUp, ExternalLink,
   ShieldCheck, ShieldAlert, Info, Smartphone,
   UserPlus, KeyRound, Archive, RotateCcw, ClipboardList, User, Lock,
-  MapPin, Navigation, Target, AlertTriangle, CheckCircle, XCircle as XCircleIcon
+  MapPin, Navigation, Target, AlertTriangle, CheckCircle, XCircle as XCircleIcon,
+  ArrowLeft, ArrowRight
 } from "lucide-react";
 import { toast, Toaster } from "sonner";
-
-delete (L.Icon.Default.prototype as any)._getIconUrl;
-
 
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -415,10 +412,12 @@ function detectSpoofing(
 
 /** Full GPS verification pipeline: multi-sample → smooth → anti-spoof → geofence */
 /** Full Production-Grade GPS Pipeline */
+/** Full Production-Grade GPS Pipeline */
 async function runGPSPipeline(
   geofences: GeofenceZone[],
   onProgress: (msg: string, accuracy: number, timeRem: number) => void,
-  maxWaitMs = 12000 // Give it 12 seconds to stabilize
+  maxWaitMs = 12000, // Give it 12 seconds to stabilize
+  signal?: AbortSignal
 ): Promise<GPSVerificationResult> {
   return new Promise((resolve) => {
     const rawSamples: GeolocationPosition[] = [];
@@ -433,12 +432,20 @@ async function runGPSPipeline(
 
     const timeout = setTimeout(() => { finish(); }, maxWaitMs);
 
+    // ABORT CONTROLLER LISTENER: Immediately cancel the GPS pipeline if user clicks "Back"
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        clearTimeout(timeout);
+        if (watchId) navigator.geolocation.clearWatch(watchId);
+        resolve(generateErrorResult("GPS acquisition cancelled by user."));
+      });
+    }
+
     watchId = navigator.geolocation.watchPosition(
       (pos) => {
         const elapsed = Date.now() - startTime;
         
         // 1. WARM-UP PHASE: Ignore the first 2 seconds of data entirely
-        // The OS usually dumps a cached, highly inaccurate Wi-Fi location first.
         if (elapsed < 2000) {
             onProgress("Warming up GPS sensor...", pos.coords.accuracy, Math.max(0, (maxWaitMs - elapsed) / 1000));
             return;
@@ -452,8 +459,7 @@ async function runGPSPipeline(
         
         onProgress("Acquiring precision lock...", pos.coords.accuracy, remaining);
 
-        // 3. EARLY EXIT: If we get a "Grab-level" lock (under 12 meters) with at least 3 samples,
-        // we don't need to make the user wait the full 12 seconds.
+        // 3. EARLY EXIT: If we get a "Grab-level" lock (under 12 meters) with at least 3 samples
         if (pos.coords.accuracy <= 12 && rawSamples.length >= 3) {
           clearTimeout(timeout);
           finish();
@@ -479,14 +485,12 @@ async function runGPSPipeline(
       }
 
       // 4. WEIGHTED AVERAGE FILTER (Drift Reduction)
-      // Gives heavy mathematical preference to readings with low 'accuracy' radiuses
       let totalWeight = 0;
       let wLat = 0;
       let wLng = 0;
       let bestAccuracy = Infinity;
 
       rawSamples.forEach(sample => {
-          // Weight formula: inverse square of the accuracy (penalizes bad readings heavily)
           const weight = 1 / Math.pow(sample.coords.accuracy, 2);
           totalWeight += weight;
           wLat += sample.coords.latitude * weight;
@@ -509,9 +513,6 @@ async function runGPSPipeline(
       let bestZone: GeofenceZone | null = null;
       let bestDist = Infinity;
 
-      // The Buffer allows a user to be technically outside the circle by a few meters,
-      // IF their GPS accuracy margin of error overlaps with the geofence.
-      // Cap the grace period at 30 meters to prevent abuse.
       const dynamicBuffer = Math.min(settledPosition.accuracy * 0.6, 30); 
 
       for (const zone of activeZones) {
@@ -529,7 +530,6 @@ async function runGPSPipeline(
 
       const insideGeofence = bestZone !== null && bestDist <= (bestZone.radius + dynamicBuffer);
       
-      // Final Approval Logic: Must be highly accurate (<50m), inside zone, and not spoofing
       const approved = settledPosition.accuracy <= 50 && insideGeofence && riskLevel !== "high";
 
       resolve({
@@ -1200,44 +1200,49 @@ function RiskBadge({ level }: { level: RiskLevel }) {
 
 // ─── Force Check-In Gate ──────────────────────────────────────────────────────
 
-function ForceCheckInGate({ user, geofences, onComplete }: {
-  user: User; geofences: GeofenceZone[]; onComplete: (record: AttendanceRecord) => void;
-}) {
-  const [step, setStep] = useState<CheckInStep>("auth");
+function ForceCheckInGate({ user, geofences, onComplete }: { user: User; geofences: GeofenceZone[]; onComplete: (record: AttendanceRecord) => void; }) {
+  const [step, setStep] = useState("auth");
   const [authMethod, setAuthMethod] = useState("");
-  
-  // FIXED: Single declaration of gpsProgress with the updated signature
   const [gpsProgress, setGpsProgress] = useState({ msg: "Initializing GPS…", accuracy: 999, timeRem: 10 });
   const [gpsResult, setGpsResult] = useState<GPSVerificationResult | null>(null);
   const [result, setResult] = useState<{ timeIn: string; status: AttendanceStatus; method: string } | null>(null);
   const [phtNow, setPhtNow] = useState(new Date());
-
+  
+  const abortCtrlRef = useRef<AbortController | null>(null);
+  
   useEffect(() => {
     const t = setInterval(() => setPhtNow(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
-
+  
   const phtTime = fmtTimePHT(phtNow);
   const phtD = getPHTDate();
   const arrivalStatus = getArrivalStatus(phtD.getHours(), phtD.getMinutes());
   const statusColor: Record<string, string> = { Early: "text-sky-400", "On Time": "text-emerald-400", Late: "text-amber-400" };
 
-  // Step 1 complete → trigger GPS pipeline
   async function onBiometricSuccess(method: string) {
     setAuthMethod(method);
+    if (method.includes("Simulated")) {
+      setGpsResult({ ...DEMO_GPS });
+      setStep("geofence_result");
+      return;
+    }
     setStep("gps");
     setGpsProgress({ msg: "Requesting device GPS permission…", accuracy: 999, timeRem: 10 });
-
     let gps: GPSVerificationResult;
+    
+    abortCtrlRef.current = new AbortController();
+    
     try {
-      // FIXED: runGPSPipeline is now properly inside this async function
       gps = await runGPSPipeline(
         geofences,
         (msg, accuracy, timeRem) => setGpsProgress({ msg, accuracy, timeRem }),
-        10000
+        10000,
+        abortCtrlRef.current.signal
       );
+      // If the user clicked "Back", abort the state updates
+      if (abortCtrlRef.current.signal.aborted) return;
     } catch {
-      // GPS pipeline error → use demo GPS for simulation environments
       gps = {
         reading: { lat: 0, lng: 0, accuracy: 999, speed: null, heading: null, timestamp: Date.now(), source: "manual" },
         accuracyScore: 0, riskLevel: "high",
@@ -1250,9 +1255,18 @@ function ForceCheckInGate({ user, geofences, onComplete }: {
     setStep("geofence_result");
   }
 
+  function handleBack() {
+    if (step === "gps") {
+      abortCtrlRef.current?.abort(); // Shut down the GPS tracker
+      setStep("auth");
+    } else if (step === "geofence_result") {
+      setStep("auth");
+      setGpsResult(null);
+    }
+  }
+
   function onSimulate() {
     setAuthMethod("Simulated · Demo Mode");
-    // Skip GPS, use demo GPS result
     setGpsResult({ ...DEMO_GPS });
     setStep("geofence_result");
   }
@@ -1272,7 +1286,10 @@ function ForceCheckInGate({ user, geofences, onComplete }: {
       gps: gpsResult ?? undefined,
     };
     setResult({ timeIn, status, method: authMethod });
-    setTimeout(() => { setStep("done"); setTimeout(() => onComplete(record), 1800); }, 600);
+    setTimeout(() => {
+      setStep("done");
+      setTimeout(() => onComplete(record), 1800);
+    }, 600);
   }
 
   const pipelineSteps = [
@@ -1283,236 +1300,245 @@ function ForceCheckInGate({ user, geofences, onComplete }: {
   ];
 
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center p-4">
-      <Toaster theme="dark" position="top-right" richColors />
-      <div className="w-full max-w-md">
-        {/* Header */}
-        <div className="text-center mb-5">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-primary/15 border border-primary/25 mb-3">
-            <Clock size={26} className="text-primary" />
-          </div>
-          <h1 className="text-xl font-bold text-foreground">Check In for Today</h1>
-          <p className="text-muted-foreground text-sm mt-1">Login → Biometric → GPS → Geofence</p>
+    <div className="w-full max-w-md mx-auto space-y-6">
+      <div className="text-center">
+        <h1 className="text-2xl font-bold tracking-tight">Check In for Today</h1>
+        <div className="flex items-center justify-center gap-1.5 mt-2 text-[10px] font-mono text-muted-foreground">
+          Login &rarr; Biometric &rarr; GPS &rarr; Geofence
         </div>
+      </div>
 
-        {/* Pipeline indicator */}
-        <div className="flex items-center justify-center gap-1 mb-4">
-          {pipelineSteps.map((s, i) => (
-            <div key={s.label} className="flex items-center gap-1">
-              {i > 0 && <div className={`w-6 h-px ${s.done ? "bg-primary" : "bg-border"}`} />}
-              <span className={`flex items-center gap-1 text-[10px] font-mono ${s.done ? "text-primary" : "text-muted-foreground"}`}>
-                <span className={`w-4 h-4 rounded-full border flex items-center justify-center text-[8px] font-bold ${s.done ? "border-primary bg-primary/20 text-primary" : "border-border"}`}>
-                  {s.done ? "✓" : i + 1}
-                </span>
-                <span className="hidden sm:inline">{s.label}</span>
-              </span>
+      <div className="flex items-center justify-between gap-1 mt-4">
+        {pipelineSteps.map((s, i) => (
+          <React.Fragment key={s.label}>
+            {i > 0 && <div className={`flex-1 h-px ${s.done ? "bg-primary" : "bg-border"}`} />}
+            <div className={`flex flex-col items-center gap-1.5 ${s.done ? "text-primary" : "text-muted-foreground opacity-50"}`}>
+               <div className={`w-5 h-5 rounded-full flex items-center justify-center border-2 ${s.done ? "border-primary bg-primary/20" : "border-muted bg-transparent"}`}>
+                 {s.done && <CheckCircle2 size={12} className="text-primary" />}
+               </div>
             </div>
-          ))}
-        </div>
+          </React.Fragment>
+        ))}
+      </div>
 
-        <div className="bg-card border border-border rounded-xl p-5 space-y-5">
-          {/* Employee + PHT header */}
-          <div className="flex items-center justify-between pb-4 border-b border-border">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-sm font-bold text-primary">{user.avatar}</div>
-              <div>
-                <p className="text-sm font-semibold text-foreground">{user.name}</p>
-                <p className="text-[10px] font-mono text-muted-foreground">{user.employeeId} · {user.department}</p>
-              </div>
+      <div className="bg-card border border-border rounded-xl p-5 shadow-sm space-y-4">
+        <div className="flex items-center justify-between pb-4 border-b border-border">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold">
+              {user.avatar}
             </div>
-            <div className="text-right">
-              <p className="text-lg font-mono font-bold text-primary">{phtTime}</p>
-              <p className={`text-[10px] font-mono font-bold ${statusColor[arrivalStatus] ?? "text-muted-foreground"}`}>{arrivalStatus} · PHT</p>
+            <div>
+              <div className="font-bold">{user.name}</div>
+              <div className="text-[10px] text-muted-foreground font-mono">{user.employeeId} · {user.department}</div>
             </div>
           </div>
+          <div className="text-right">
+             <div className="text-xl font-bold tracking-tight font-mono">{phtTime}</div>
+             <p className={`text-[10px] font-mono font-bold ${statusColor[arrivalStatus] ?? "text-muted-foreground"}`}>{arrivalStatus} · PHT</p>
+          </div>
+        </div>
 
-          {/* STEP 1: Biometric Auth */}
-          {step === "auth" && (
-            <>
-              <div className="flex items-center justify-between text-xs py-1">
+        {step === "auth" && (
+          <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+             <div className="bg-secondary/40 rounded-xl p-3 flex justify-between items-center text-xs">
                 <span className="text-muted-foreground">Work schedule</span>
-                <span className="font-mono text-foreground">7:00 AM – 4:00 PM · Mon–Fri</span>
-              </div>
-              <BiometricAuthPanel
-                userId={user.id} userName={user.name}
-                title="Step 1 — Identity Verification"
-                onSuccess={onBiometricSuccess}
-                onSimulate={onSimulate}
-              />
-            </>
-          )}
+                <span className="font-semibold">7:00 AM – 4:00 PM · Mon–Fri</span>
+             </div>
+             <BiometricAuthPanel userId={user.id} userName={user.name} title="Step 1 — Identity Verification" onSuccess={onBiometricSuccess} onSimulate={onSimulate} />
+          </div>
+        )}
 
-          {/* STEP 2: GPS Acquiring */}
-          {step === "gps" && (
-            <div className="space-y-4">
-              <div className="flex flex-col items-center py-6 gap-4">
-                {/* Radar Animation */}
-                <div className="relative flex items-center justify-center h-24">
-                  <div className="absolute w-24 h-24 rounded-full border border-primary/30 animate-[ping_2s_cubic-bezier(0,0,0.2,1)_infinite]" />
-                  <div className="absolute w-16 h-16 rounded-full border border-primary/50 animate-[ping_1.5s_cubic-bezier(0,0,0.2,1)_infinite]" />
-                  <div className="relative w-12 h-12 rounded-full bg-primary flex items-center justify-center shadow-lg shadow-primary/20">
-                    <Navigation size={20} className="text-primary-foreground animate-pulse" />
-                  </div>
-                </div>
-
-                <div className="text-center space-y-1">
-                  <p className="text-sm font-semibold text-foreground">Acquiring Precision GPS</p>
-                  <p className="text-xs text-muted-foreground">{gpsProgress.msg}</p>
-                </div>
-
-                <div className="w-full bg-secondary/50 border border-border rounded-xl p-4 space-y-3">
-                  <div className="flex justify-between items-center text-[10px] font-mono">
-                    <span className="text-muted-foreground uppercase tracking-wider">Current Accuracy</span>
-                    <span className={
-                      gpsProgress.accuracy <= 20 ? "text-emerald-400 font-bold" : 
-                      gpsProgress.accuracy <= 65 ? "text-amber-400" : "text-red-400"
-                    }>
-                      {gpsProgress.accuracy < 999 ? `±${Math.round(gpsProgress.accuracy)}m` : "Calculating..."}
-                    </span>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <div className="flex justify-between text-[10px] font-mono text-muted-foreground">
-                      <span>Filtering Signal</span>
-                      <span>{gpsProgress.timeRem}s remaining max</span>
+        {step === "gps" && (
+           <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 py-4">
+              <div className="flex flex-col items-center justify-center text-center space-y-4">
+                 <div className="relative">
+                    <div className="absolute inset-0 bg-primary/20 rounded-full animate-ping" />
+                    <div className="w-16 h-16 bg-primary/20 rounded-full flex items-center justify-center relative z-10">
+                       <MapPin className="text-primary animate-pulse" size={28} />
                     </div>
-                    <div className="w-full bg-background rounded-full h-1.5 overflow-hidden">
-                      <div 
-                        className="bg-primary h-full rounded-full transition-all duration-1000 ease-linear" 
-                        style={{ width: `${100 - ((gpsProgress.timeRem) / 10) * 100}%` }} 
-                      />
-                    </div>
-                  </div>
-                  
-                  <p className="text-[9px] text-muted-foreground/70 text-center pt-1 leading-tight">
-                    Please stand still and ensure clear view of the sky. Will auto-resolve early if high accuracy is achieved.
-                  </p>
-                </div>
+                 </div>
+                 <div>
+                    <div className="text-sm font-bold">Acquiring Precision GPS</div>
+                    <div className="text-xs text-muted-foreground mt-1">{gpsProgress.msg}</div>
+                 </div>
               </div>
-            </div>
-          )}
-
-          {/* STEP 3: Geofence Result */}
-          {step === "geofence_result" && gpsResult && (
-            <div className="space-y-4">
-              <p className="text-xs font-semibold text-foreground">Step 3 — Geofence Validation</p>
-
-              {/* GPS Reading Details */}
-              <div className="bg-secondary/50 rounded-xl p-3 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono text-muted-foreground uppercase">GPS Data</span>
-                  <RiskBadge level={gpsResult.riskLevel} />
-                </div>
-                <AccuracyScoreBar score={gpsResult.accuracyScore} />
-                <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
-                  <div><span className="text-muted-foreground">Accuracy: </span><span className="text-foreground">{gpsResult.reading.accuracy > 500 ? "N/A" : `±${Math.round(gpsResult.reading.accuracy)}m`}</span></div>
-                  <div><span className="text-muted-foreground">Source: </span><span className="text-foreground capitalize">{gpsResult.reading.source}</span></div>
-                  {gpsResult.reading.lat !== 0 && <>
-                    <div><span className="text-muted-foreground">Lat: </span><span className="text-foreground">{gpsResult.reading.lat.toFixed(5)}</span></div>
-                    <div><span className="text-muted-foreground">Lng: </span><span className="text-foreground">{gpsResult.reading.lng.toFixed(5)}</span></div>
-                  </>}
-                </div>
-                {gpsResult.riskReasons.length > 0 && (
-                  <div className="space-y-1 pt-1 border-t border-border">
-                    {gpsResult.riskReasons.map((r, i) => (
-                      <div key={i} className="flex gap-1.5 items-start">
-                        <AlertTriangle size={10} className="text-amber-400 shrink-0 mt-0.5" />
-                        <p className="text-[10px] text-amber-400">{r}</p>
-                      </div>
-                    ))}
-                  </div>
-                )}
+              <div className="bg-secondary/50 rounded-xl p-4 flex items-center justify-between">
+                 <div className="text-xs font-semibold text-muted-foreground">Current Accuracy</div>
+                 <span className={`text-sm font-mono ${gpsProgress.accuracy <= 20 ? "text-emerald-400 font-bold" : gpsProgress.accuracy <= 65 ? "text-amber-400" : "text-red-400"}`}>
+                    {gpsProgress.accuracy < 999 ? `±${Math.round(gpsProgress.accuracy)}m` : "Calculating..."}
+                 </span>
+              </div>
+              <div className="space-y-1.5">
+                 <div className="flex justify-between text-[10px] font-mono text-muted-foreground">
+                    <span>Filtering Signal</span>
+                    <span>{gpsProgress.timeRem}s remaining max</span>
+                 </div>
+                 <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                    <div className="bg-primary h-full rounded-full transition-all duration-1000 ease-linear" style={{ width: `${100 - ((gpsProgress.timeRem) / 10) * 100}%` }} />
+                 </div>
+              </div>
+              <div className="text-[10px] text-center text-muted-foreground max-w-[250px] mx-auto leading-relaxed">
+                 Please stand still and ensure clear view of the sky. Will auto-resolve early if high accuracy is achieved.
               </div>
 
-              {/* Geofence Result */}
-              <div className={`rounded-xl p-3 border ${gpsResult.insideGeofence ? "bg-emerald-500/10 border-emerald-500/20" : "bg-red-500/10 border-red-500/20"}`}>
-                <div className="flex items-center gap-2 mb-2">
-                  <Target size={14} className={gpsResult.insideGeofence ? "text-emerald-400" : "text-red-400"} />
-                  <span className={`text-xs font-semibold ${gpsResult.insideGeofence ? "text-emerald-400" : "text-red-400"}`}>
-                    {gpsResult.insideGeofence ? "Inside Allowed Zone ✓" : "Outside Allowed Zone ✗"}
-                  </span>
-                </div>
-                {gpsResult.geofenceName ? (
-                  <div className="text-[10px] font-mono space-y-0.5">
-                    <p className="text-foreground font-semibold">{gpsResult.geofenceName}</p>
-                    {gpsResult.distanceFromGeofence !== null && (
-                      <p className="text-muted-foreground">{gpsResult.distanceFromGeofence}m from zone center</p>
-                    )}
-                  </div>
-                ) : (
-                  <p className="text-[10px] text-muted-foreground">No active geofence zones found near your location.</p>
-                )}
-              </div>
-
-              {/* Decision */}
-              {gpsResult.approved ? (
-                <button onClick={proceedToRecord}
-                  className="w-full flex items-center justify-center gap-2 bg-primary text-primary-foreground rounded-xl py-3 text-sm font-semibold hover:bg-primary/90 transition-all active:scale-[0.99]">
-                  <CheckCheck size={16} /> Confirm Check-In
-                </button>
-              ) : (
-                <div className="space-y-3">
-                  <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-xs text-red-400 space-y-1">
-                    <p className="font-semibold">Attendance Denied</p>
-                    {!gpsResult.insideGeofence && <p>You are outside all authorized attendance zones.</p>}
-                    {gpsResult.riskLevel === "high" && <p>High fraud risk detected — attendance cannot be recorded.</p>}
-                    {gpsResult.reading.accuracy > 100 && <p>GPS accuracy too low ({Math.round(gpsResult.reading.accuracy)}m) — minimum 100m required.</p>}
-                  </div>
-                  <button onClick={proceedToRecord}
-                    className="w-full flex items-center justify-center gap-2 bg-amber-500/15 border border-amber-500/30 text-amber-400 rounded-xl py-2.5 text-xs font-semibold hover:bg-amber-500/25 transition-all">
-                    Request Manual Override (Admin Approval Required)
+              <div className="pt-2 flex justify-center border-t border-border">
+                  <button onClick={handleBack} className="flex items-center gap-2 text-xs font-semibold text-muted-foreground hover:text-foreground transition-colors px-4 py-2 mt-2 bg-secondary/50 hover:bg-secondary rounded-lg">
+                      <ArrowLeft size={14} /> Cancel & Go Back
                   </button>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Saving */}
-          {step === "saving" && (
-            <div className="flex flex-col items-center py-8 gap-3">
-              <RefreshCw size={26} className="text-primary animate-spin" />
-              <p className="text-sm font-semibold text-foreground">Recording attendance...</p>
-              <p className="text-xs text-muted-foreground">Philippine Time · {todayStrPHT()}</p>
-            </div>
-          )}
-
-          {/* Done */}
-          {step === "done" && result && (
-            <div className="space-y-4">
-              <div className="flex flex-col items-center py-3 gap-3">
-                <div className="w-16 h-16 rounded-full bg-emerald-500/20 border-2 border-emerald-500/30 flex items-center justify-center">
-                  <CheckCheck size={32} className="text-emerald-400" />
-                </div>
-                <div className="text-center">
-                  <p className="text-lg font-bold text-foreground">Check-In Successful!</p>
-                  <p className="text-xs text-muted-foreground mt-0.5">Your attendance has been recorded</p>
-                </div>
               </div>
-              <div className="bg-secondary/50 rounded-xl p-4 grid grid-cols-2 gap-3">
-                {[
-                  ["Time In", result.timeIn],
-                  ["Status", result.status],
-                  ["Auth", result.method.split(" · ")[0]],
-                  ["Date", todayStrPHT()],
-                  ["GPS Score", gpsResult ? `${gpsResult.accuracyScore}/100` : "—"],
-                  ["Geofence", gpsResult?.geofenceName ?? "—"],
-                ].map(([k, v]) => (
-                  <div key={k}>
-                    <p className="text-[9px] font-mono text-muted-foreground uppercase tracking-wider">{k}</p>
-                    <p className="text-xs font-semibold text-foreground mt-0.5 truncate">{v}</p>
-                  </div>
-                ))}
+           </div>
+        )}
+
+        {step === "geofence_result" && gpsResult && (
+           <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="text-center">
+                 <h2 className="text-xl font-bold tracking-tight">Step 3 — Geofence Validation</h2>
               </div>
-              {gpsResult && (
-                <div className="flex items-center justify-between">
-                  <AccuracyScoreBar score={gpsResult.accuracyScore} label="GPS Accuracy" />
-                  <div className="ml-3 shrink-0"><RiskBadge level={gpsResult.riskLevel} /></div>
-                </div>
+              
+              {/* LEAFLET MAP VISUALIZATION */}
+              <div className="w-full h-48 rounded-xl overflow-hidden border border-border relative z-[0]">
+                 <MapContainer center={gpsResult.reading.lat !== 0 ? [gpsResult.reading.lat, gpsResult.reading.lng] : [14.5995, 120.9842]} zoom={17} style={{ width: "100%", height: "100%" }} zoomControl={false}>
+                    <TileLayer attribution='&copy; OSM' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+                    {gpsResult.reading.lat !== 0 && (
+                       <>
+                          <Marker position={[gpsResult.reading.lat, gpsResult.reading.lng]} />
+                          <Circle center={[gpsResult.reading.lat, gpsResult.reading.lng]} radius={gpsResult.reading.accuracy} pathOptions={{ color: "hsl(var(--primary))", fillColor: "hsl(var(--primary))", fillOpacity: 0.15, weight: 1 }} />
+                          <FlyToLocation lat={gpsResult.reading.lat} lng={gpsResult.reading.lng} />
+                       </>
+                    )}
+                    {geofences.filter(g => g.active).map(z => (
+                       <Circle key={z.id} center={[z.lat, z.lng]} radius={z.radius} pathOptions={{ color: z.id === gpsResult.geofenceId ? "#10b981" : "#f59e0b", fillColor: z.id === gpsResult.geofenceId ? "#10b981" : "#f59e0b", fillOpacity: 0.1, weight: 2 }} />
+                    ))}
+                 </MapContainer>
+                 <div className="absolute top-2 right-2 z-[400]">
+                    <button onClick={() => onBiometricSuccess(authMethod)} className="flex items-center gap-1.5 bg-card text-card-foreground shadow-md px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-muted transition-colors border border-border">
+                       <RefreshCw size={14} /> Re-detect
+                    </button>
+                 </div>
+              </div>
+
+              <div className="flex items-center justify-between mt-2">
+                 <h3 className="text-xs font-bold text-muted-foreground uppercase tracking-wider">GPS Data</h3>
+              </div>
+              
+              <div className="grid grid-cols-2 gap-2">
+                 <div className="bg-secondary/50 rounded-xl p-3">
+                    <div className="text-[10px] text-muted-foreground font-mono mb-1">Accuracy</div>
+                    <div className="text-sm font-semibold">{gpsResult.reading.accuracy > 500 ? "N/A" : `±${Math.round(gpsResult.reading.accuracy)}m`}</div>
+                 </div>
+                 <div className="bg-secondary/50 rounded-xl p-3">
+                    <div className="text-[10px] text-muted-foreground font-mono mb-1">Source</div>
+                    <div className="text-sm font-semibold">{gpsResult.reading.source}</div>
+                 </div>
+              </div>
+
+              {gpsResult.reading.lat !== 0 && (
+                 <div className="text-[10px] font-mono text-muted-foreground text-center">
+                    Lat: {gpsResult.reading.lat.toFixed(5)} Lng: {gpsResult.reading.lng.toFixed(5)}
+                 </div>
               )}
-              <p className="text-[10px] text-muted-foreground text-center animate-pulse">Redirecting to dashboard...</p>
-            </div>
-          )}
-        </div>
+
+              {gpsResult.riskReasons.length > 0 && (
+                 <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3 space-y-1.5">
+                    <div className="text-xs font-bold text-red-400 flex items-center gap-1.5">
+                       <AlertTriangle size={14} /> GPS Risk Flags Detected
+                    </div>
+                    <ul className="list-disc list-inside text-[10px] text-red-400/80 pl-4 space-y-0.5">
+                       {gpsResult.riskReasons.map((r, i) => (
+                          <li key={i}>{r}</li>
+                       ))}
+                    </ul>
+                 </div>
+              )}
+
+              <div className={`rounded-xl p-3 border ${gpsResult.insideGeofence ? "bg-emerald-500/10 border-emerald-500/20" : "bg-red-500/10 border-red-500/20"}`}>
+                 <div className="flex items-center gap-2">
+                    <Target size={14} className={gpsResult.insideGeofence ? "text-emerald-400" : "text-red-400"} />
+                    <span className={`text-xs font-semibold ${gpsResult.insideGeofence ? "text-emerald-400" : "text-red-400"}`}>
+                       {gpsResult.insideGeofence ? "Inside Allowed Zone ✓" : "Outside Allowed Zone ✗"}
+                    </span>
+                 </div>
+                 <div className="mt-1 text-[10px] text-muted-foreground">
+                    {gpsResult.geofenceName ? (
+                       <>
+                          <span className="font-semibold text-foreground">{gpsResult.geofenceName}</span>
+                          {gpsResult.distanceFromGeofence !== null && (
+                             <span className="block mt-0.5">{gpsResult.distanceFromGeofence}m from zone center</span>
+                          )}
+                       </>
+                    ) : (
+                       "No active geofence zones found near your location."
+                    )}
+                 </div>
+              </div>
+
+              {gpsResult.approved ? (
+                 <div className="flex gap-3">
+                     <button onClick={handleBack} className="px-4 py-3 bg-secondary rounded-xl text-muted-foreground hover:text-foreground transition-colors flex items-center justify-center">
+                         <ArrowLeft size={16} />
+                     </button>
+                     <button onClick={proceedToRecord} className="flex-1 flex items-center justify-center gap-2 bg-primary text-primary-foreground rounded-xl py-3 text-sm font-semibold hover:bg-primary/90 transition-all active:scale-[0.99]">
+                        Confirm Check-In <ArrowRight size={16} />
+                     </button>
+                 </div>
+              ) : (
+                 <div className="space-y-3">
+                    <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3 text-center">
+                       <div className="text-sm font-bold text-red-400 mb-1">Attendance Denied</div>
+                       <div className="text-xs text-red-400/80">
+                          {!gpsResult.insideGeofence && "You are outside all authorized attendance zones. "}
+                          {gpsResult.riskLevel === "high" && "High fraud risk detected — attendance cannot be recorded. "}
+                          {gpsResult.reading.accuracy > 100 && `GPS accuracy too low (${Math.round(gpsResult.reading.accuracy)}m) — minimum 100m required.`}
+                       </div>
+                    </div>
+                    <div className="flex gap-3">
+                        <button onClick={handleBack} className="px-4 py-2.5 bg-secondary rounded-xl text-muted-foreground hover:text-foreground transition-colors flex items-center justify-center">
+                             <ArrowLeft size={16} />
+                         </button>
+                        <button onClick={proceedToRecord} className="flex-1 flex items-center justify-center gap-2 bg-amber-500/15 border border-amber-500/30 text-amber-400 rounded-xl py-2.5 text-xs font-semibold hover:bg-amber-500/25 transition-all">
+                           Request Manual Override
+                        </button>
+                    </div>
+                 </div>
+              )}
+           </div>
+        )}
+
+        {step === "saving" && (
+           <div className="flex flex-col items-center justify-center py-10 space-y-4 animate-in fade-in zoom-in duration-500">
+              <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+              <div className="text-sm font-bold">Recording attendance...</div>
+              <div className="text-xs text-muted-foreground font-mono">Philippine Time · {todayStrPHT()}</div>
+           </div>
+        )}
+
+        {step === "done" && result && (
+           <div className="flex flex-col items-center justify-center py-6 space-y-6 animate-in fade-in zoom-in duration-500 text-center">
+              <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center">
+                 <CheckCircle2 size={32} className="text-emerald-500" />
+              </div>
+              <div>
+                 <h2 className="text-xl font-bold">Check-In Successful!</h2>
+                 <p className="text-sm text-muted-foreground mt-1">Your attendance has been recorded</p>
+              </div>
+              <div className="bg-secondary/40 rounded-xl p-4 w-full text-left space-y-2">
+                 {[
+                    ["Time In", result.timeIn],
+                    ["Status", result.status],
+                    ["Auth", result.method.split(" · ")[0]],
+                    ["Date", todayStrPHT()],
+                    ["GPS Score", gpsResult ? `${gpsResult.accuracyScore}/100` : "—"],
+                    ["Geofence", gpsResult?.geofenceName ?? "—"],
+                 ].map(([k, v]) => (
+                    <div key={k} className="flex justify-between">
+                       <span className="text-xs text-muted-foreground">{k}</span>
+                       <span className="text-xs font-bold">{v}</span>
+                    </div>
+                 ))}
+              </div>
+              <p className="text-xs font-mono text-muted-foreground animate-pulse">Redirecting to dashboard...</p>
+           </div>
+        )}
       </div>
     </div>
   );
@@ -1520,14 +1546,60 @@ function ForceCheckInGate({ user, geofences, onComplete }: {
 
 // ─── Check-Out Modal ──────────────────────────────────────────────────────────
 
-function CheckOutModal({ user, todayRecord, onComplete, onClose }: {
-  user: User; todayRecord: AttendanceRecord;
-  onComplete: (updated: AttendanceRecord) => void; onClose: () => void;
-}) {
-  const [step, setStep] = useState<"auth" | "saving" | "done">("auth");
+function CheckOutModal({ user, geofences, todayRecord, onComplete, onClose }: { user: User; geofences: GeofenceZone[]; todayRecord: AttendanceRecord; onComplete: (updated: AttendanceRecord) => void; onClose: () => void; }) { 
+  const [step, setStep] = useState<"auth" | "gps" | "geofence_result" | "saving" | "done">("auth");
   const [summary, setSummary] = useState<{ timeOut: string; totalHours: number; ot: number } | null>(null);
+  const [authMethod, setAuthMethod] = useState("");
+  const [gpsProgress, setGpsProgress] = useState({ msg: "Initializing GPS…", accuracy: 999, timeRem: 10 });
+  const [gpsResult, setGpsResult] = useState<GPSVerificationResult | null>(null);
 
-  function completeCheckout(method: string) {
+  const abortCtrlRef = useRef<AbortController | null>(null);
+
+  async function onBiometricSuccess(method: string) {
+    setAuthMethod(method);
+    if (method.includes("Simulated")) {
+      setGpsResult({ ...DEMO_GPS });
+      setStep("geofence_result");
+      return;
+    }
+    setStep("gps");
+    setGpsProgress({ msg: "Requesting device GPS permission…", accuracy: 999, timeRem: 10 });
+    let gps: GPSVerificationResult;
+    
+    abortCtrlRef.current = new AbortController();
+    
+    try {
+      gps = await runGPSPipeline(
+        geofences,
+        (msg, accuracy, timeRem) => setGpsProgress({ msg, accuracy, timeRem }),
+        10000,
+        abortCtrlRef.current.signal
+      );
+      if (abortCtrlRef.current.signal.aborted) return;
+    } catch {
+      gps = {
+        reading: { lat: 0, lng: 0, accuracy: 999, speed: null, heading: null, timestamp: Date.now(), source: "manual" },
+        accuracyScore: 0, riskLevel: "high",
+        riskReasons: ["GPS pipeline error — browser may not support geolocation"],
+        geofenceId: null, geofenceName: null, distanceFromGeofence: null,
+        insideGeofence: false, approved: false,
+      };
+    }
+    setGpsResult(gps);
+    setStep("geofence_result");
+  }
+
+  function handleBack() {
+    if (step === "gps") {
+      abortCtrlRef.current?.abort();
+      setStep("auth");
+    } else if (step === "geofence_result") {
+      setStep("auth");
+      setGpsResult(null);
+    }
+  }
+
+  function completeCheckout() {
     setStep("saving");
     const now = getPHTDate();
     const timeOut = fmtTimePHTShort(now);
@@ -1535,12 +1607,17 @@ function CheckOutModal({ user, todayRecord, onComplete, onClose }: {
     const outMins = now.getHours() * 60 + now.getMinutes();
     const totalHours = parseFloat(((outMins - inMins) / 60).toFixed(2));
     const ot = computeOTHours(timeOut);
+    
     const updated: AttendanceRecord = {
-      ...todayRecord, timeOut, totalHours,
+      ...todayRecord,
+      timeOut,
+      totalHours,
       overtimeHours: parseFloat(ot.toFixed(2)),
       undertime: computeUndertimeMinutes(timeOut),
       otStatus: ot > 0 ? "Pending" : null,
+      gps: gpsResult ?? undefined
     };
+    
     setSummary({ timeOut, totalHours, ot });
     setTimeout(() => {
       setStep("done");
@@ -1555,42 +1632,191 @@ function CheckOutModal({ user, todayRecord, onComplete, onClose }: {
     <Modal title="Check Out" onClose={onClose}>
       <div className="space-y-4">
         {/* Current session info */}
-        <div className="bg-secondary/50 rounded-xl p-3 grid grid-cols-2 gap-2 text-xs">
-          <div><p className="text-[10px] font-mono text-muted-foreground">CHECKED IN</p><p className="font-bold text-foreground mt-0.5">{todayRecord.timeIn}</p></div>
-          <div><p className="text-[10px] font-mono text-muted-foreground">STATUS</p><div className="mt-0.5"><StatusBadge status={todayRecord.status} /></div></div>
+        <div className="bg-secondary/40 rounded-xl p-4 flex items-center justify-between">
+           <div>
+              <div className="text-[10px] font-mono text-muted-foreground mb-1">CHECKED IN</div>
+              <div className="text-sm font-bold">{todayRecord.timeIn}</div>
+           </div>
+           <div className="text-right">
+              <div className="text-[10px] font-mono text-muted-foreground mb-1">STATUS</div>
+              <StatusBadge status={todayRecord.status} />
+           </div>
         </div>
 
         {step === "auth" && (
-          <BiometricAuthPanel
-            userId={user.id}
-            userName={user.name}
-            title="Verify Identity to Check Out"
-            onSuccess={completeCheckout}
-            onSimulate={() => completeCheckout("Simulated · Demo Mode")}
-          />
+           <BiometricAuthPanel userId={user.id} userName={user.name} title="Verify Identity to Check Out" onSuccess={onBiometricSuccess} onSimulate={() => onBiometricSuccess("Simulated · Demo Mode")} />
         )}
 
-        {step === "saving" && (
-          <div className="flex flex-col items-center py-8 gap-3">
-            <RefreshCw size={24} className="text-primary animate-spin" />
-            <p className="text-sm text-foreground font-semibold">Recording check-out...</p>
-          </div>
+        {step === "gps" && (
+           <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 py-4">
+              <div className="flex flex-col items-center justify-center text-center space-y-4">
+                 <div className="relative">
+                    <div className="absolute inset-0 bg-primary/20 rounded-full animate-ping" />
+                    <div className="w-16 h-16 bg-primary/20 rounded-full flex items-center justify-center relative z-10">
+                       <MapPin className="text-primary animate-pulse" size={28} />
+                    </div>
+                 </div>
+                 <div>
+                    <div className="text-sm font-bold">Acquiring Precision GPS</div>
+                    <div className="text-xs text-muted-foreground mt-1">{gpsProgress.msg}</div>
+                 </div>
+              </div>
+              <div className="bg-secondary/50 rounded-xl p-4 flex items-center justify-between">
+                 <div className="text-xs font-semibold text-muted-foreground">Current Accuracy</div>
+                 <span className={`text-sm font-mono ${gpsProgress.accuracy <= 20 ? "text-emerald-400 font-bold" : gpsProgress.accuracy <= 65 ? "text-amber-400" : "text-red-400"}`}>
+                    {gpsProgress.accuracy < 999 ? `±${Math.round(gpsProgress.accuracy)}m` : "Calculating..."}
+                 </span>
+              </div>
+              <div className="space-y-1.5">
+                 <div className="flex justify-between text-[10px] font-mono text-muted-foreground">
+                    <span>Filtering Signal</span>
+                    <span>{gpsProgress.timeRem}s remaining max</span>
+                 </div>
+                 <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                    <div className="bg-primary h-full rounded-full transition-all duration-1000 ease-linear" style={{ width: `${100 - ((gpsProgress.timeRem) / 10) * 100}%` }} />
+                 </div>
+              </div>
+              <div className="text-[10px] text-center text-muted-foreground max-w-[250px] mx-auto leading-relaxed">
+                 Please stand still and ensure clear view of the sky. Will auto-resolve early if high accuracy is achieved.
+              </div>
+
+              <div className="pt-2 flex justify-center border-t border-border">
+                  <button onClick={handleBack} className="flex items-center gap-2 text-xs font-semibold text-muted-foreground hover:text-foreground transition-colors px-4 py-2 mt-2 bg-secondary/50 hover:bg-secondary rounded-lg">
+                      <ArrowLeft size={14} /> Cancel & Go Back
+                  </button>
+              </div>
+           </div>
+        )}
+
+        {step === "geofence_result" && gpsResult && (
+           <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="text-center">
+                 <h2 className="text-xl font-bold tracking-tight">Geofence Validation</h2>
+              </div>
+              
+              {/* LEAFLET MAP VISUALIZATION */}
+              <div className="w-full h-48 rounded-xl overflow-hidden border border-border relative z-[0]">
+                 <MapContainer center={gpsResult.reading.lat !== 0 ? [gpsResult.reading.lat, gpsResult.reading.lng] : [14.5995, 120.9842]} zoom={17} style={{ width: "100%", height: "100%" }} zoomControl={false}>
+                    <TileLayer attribution='&copy; OSM' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+                    {gpsResult.reading.lat !== 0 && (
+                       <>
+                          <Marker position={[gpsResult.reading.lat, gpsResult.reading.lng]} />
+                          <Circle center={[gpsResult.reading.lat, gpsResult.reading.lng]} radius={gpsResult.reading.accuracy} pathOptions={{ color: "hsl(var(--primary))", fillColor: "hsl(var(--primary))", fillOpacity: 0.15, weight: 1 }} />
+                          <FlyToLocation lat={gpsResult.reading.lat} lng={gpsResult.reading.lng} />
+                       </>
+                    )}
+                    {geofences.filter(g => g.active).map(z => (
+                       <Circle key={z.id} center={[z.lat, z.lng]} radius={z.radius} pathOptions={{ color: z.id === gpsResult.geofenceId ? "#10b981" : "#f59e0b", fillColor: z.id === gpsResult.geofenceId ? "#10b981" : "#f59e0b", fillOpacity: 0.1, weight: 2 }} />
+                    ))}
+                 </MapContainer>
+                 <div className="absolute top-2 right-2 z-[400]">
+                    <button onClick={() => onBiometricSuccess(authMethod)} className="flex items-center gap-1.5 bg-card text-card-foreground shadow-md px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-muted transition-colors border border-border">
+                       <RefreshCw size={14} /> Re-detect
+                    </button>
+                 </div>
+              </div>
+
+              <div className="flex items-center justify-between mt-2">
+                 <h3 className="text-xs font-bold text-muted-foreground uppercase tracking-wider">GPS Data</h3>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                 <div className="bg-secondary/50 rounded-xl p-3">
+                    <div className="text-[10px] text-muted-foreground font-mono mb-1">Accuracy</div>
+                    <div className="text-sm font-semibold">{gpsResult.reading.accuracy > 500 ? "N/A" : `±${Math.round(gpsResult.reading.accuracy)}m`}</div>
+                 </div>
+                 <div className="bg-secondary/50 rounded-xl p-3">
+                    <div className="text-[10px] text-muted-foreground font-mono mb-1">Source</div>
+                    <div className="text-sm font-semibold">{gpsResult.reading.source}</div>
+                 </div>
+              </div>
+
+              {gpsResult.reading.lat !== 0 && (
+                 <div className="text-[10px] font-mono text-muted-foreground text-center">
+                    Lat: {gpsResult.reading.lat.toFixed(5)} Lng: {gpsResult.reading.lng.toFixed(5)}
+                 </div>
+              )}
+
+              <div className={`rounded-xl p-3 border ${gpsResult.insideGeofence ? "bg-emerald-500/10 border-emerald-500/20" : "bg-red-500/10 border-red-500/20"}`}>
+                 <div className="flex items-center gap-2">
+                    <Target size={14} className={gpsResult.insideGeofence ? "text-emerald-400" : "text-red-400"} />
+                    <span className={`text-xs font-semibold ${gpsResult.insideGeofence ? "text-emerald-400" : "text-red-400"}`}>
+                       {gpsResult.insideGeofence ? "Inside Allowed Zone ✓" : "Outside Allowed Zone ✗"}
+                    </span>
+                 </div>
+                 <div className="mt-1 text-[10px] text-muted-foreground">
+                    {gpsResult.geofenceName ? (
+                       <><span className="font-semibold text-foreground">{gpsResult.geofenceName}</span> {gpsResult.distanceFromGeofence !== null && `(${gpsResult.distanceFromGeofence}m from center)`}</>
+                    ) : (
+                       "No active geofence zones found near your location."
+                    )}
+                 </div>
+              </div>
+
+              {gpsResult.approved ? (
+                 <div className="flex gap-3">
+                     <button onClick={handleBack} className="px-4 py-3 bg-secondary rounded-xl text-muted-foreground hover:text-foreground transition-colors flex items-center justify-center">
+                         <ArrowLeft size={16} />
+                     </button>
+                     <button onClick={completeCheckout} className="flex-1 flex items-center justify-center gap-2 bg-red-500/15 border border-red-500/30 text-red-400 rounded-xl py-3 text-sm font-semibold hover:bg-red-500/25 active:scale-[0.99] transition-all">
+                        Complete Check-Out <ArrowRight size={16} />
+                     </button>
+                 </div>
+              ) : (
+                 <div className="space-y-3">
+                    <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3 text-center">
+                       <div className="text-sm font-bold text-red-400 mb-1">Check-Out Denied</div>
+                       <div className="text-xs text-red-400/80">
+                          {!gpsResult.insideGeofence && "You are outside all authorized attendance zones. "}
+                          {gpsResult.riskLevel === "high" && "High fraud risk detected. "}
+                          {gpsResult.reading.accuracy > 100 && `GPS accuracy too low (${Math.round(gpsResult.reading.accuracy)}m).`}
+                       </div>
+                    </div>
+                    <div className="flex gap-3">
+                        <button onClick={handleBack} className="px-4 py-2.5 bg-secondary rounded-xl text-muted-foreground hover:text-foreground transition-colors flex items-center justify-center">
+                             <ArrowLeft size={16} />
+                         </button>
+                        <button onClick={completeCheckout} className="flex-1 flex items-center justify-center gap-2 bg-amber-500/15 border border-amber-500/30 text-amber-400 rounded-xl py-2.5 text-xs font-semibold hover:bg-amber-500/25 transition-all">
+                           Request Manual Override
+                        </button>
+                    </div>
+                 </div>
+              )}
+           </div>
+        )}
+
+        {step === "saving" && summary && (
+           <div className="flex flex-col items-center justify-center py-10 space-y-4 animate-in fade-in zoom-in duration-500">
+              <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+              <div className="text-sm font-bold">Recording check-out...</div>
+           </div>
         )}
 
         {step === "done" && summary && (
-          <div className="space-y-4">
-            <div className="flex flex-col items-center py-4 gap-2">
-              <div className="w-14 h-14 rounded-full bg-emerald-500/20 border-2 border-emerald-500/30 flex items-center justify-center">
-                <CheckCheck size={28} className="text-emerald-400" />
+           <div className="flex flex-col items-center justify-center py-6 space-y-6 animate-in fade-in zoom-in duration-500 text-center">
+              <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center">
+                 <CheckCircle2 size={32} className="text-emerald-500" />
               </div>
-              <p className="text-base font-bold text-foreground">Check-Out Successful!</p>
-            </div>
-            <div className="bg-secondary/50 rounded-xl p-4 grid grid-cols-3 gap-3 text-center">
-              <div><p className="text-[9px] font-mono text-muted-foreground uppercase">Time Out</p><p className="text-sm font-bold text-foreground mt-1">{summary.timeOut}</p></div>
-              <div><p className="text-[9px] font-mono text-muted-foreground uppercase">Total Hrs</p><p className="text-sm font-bold text-primary mt-1">{summary.totalHours}h</p></div>
-              <div><p className="text-[9px] font-mono text-muted-foreground uppercase">OT Hrs</p><p className={`text-sm font-bold mt-1 ${summary.ot > 0 ? "text-indigo-400" : "text-muted-foreground"}`}>{summary.ot > 0 ? summary.ot.toFixed(2) + "h" : "—"}</p></div>
-            </div>
-          </div>
+              <div>
+                 <h2 className="text-xl font-bold">Check-Out Successful!</h2>
+                 <p className="text-sm text-muted-foreground mt-1">Your shift has ended.</p>
+              </div>
+              <div className="bg-secondary/40 rounded-xl p-4 w-full text-left space-y-2">
+                 <div className="flex justify-between">
+                    <span className="text-xs text-muted-foreground">Time Out</span>
+                    <span className="text-xs font-bold">{summary.timeOut}</span>
+                 </div>
+                 <div className="flex justify-between">
+                    <span className="text-xs text-muted-foreground">Total Hrs</span>
+                    <span className="text-xs font-bold text-primary">{summary.totalHours}h</span>
+                 </div>
+                 {summary.ot > 0 && (
+                    <div className="flex justify-between pt-2 border-t border-border">
+                       <span className="text-xs text-muted-foreground">OT Hrs (Pending)</span>
+                       <span className="text-xs font-bold text-indigo-400">{summary.ot.toFixed(2)}h</span>
+                    </div>
+                 )}
+              </div>
+           </div>
         )}
       </div>
     </Modal>
@@ -1886,55 +2112,89 @@ function EmployeeDashboard({ user, attendance, onNavigateTo }: { user: User; att
 
 // ─── Check-Out Page ───────────────────────────────────────────────────────────
 
-function CheckOutPage({ user, attendance, onUpdate }: { user: User; attendance: AttendanceRecord[]; onUpdate: (r: AttendanceRecord[]) => void; }) {
+function CheckOutPage({ user, attendance, geofences, onUpdate }: { user: User; attendance: AttendanceRecord[]; geofences: GeofenceZone[]; onUpdate: (r: AttendanceRecord[]) => void; }) { 
   const todayStr = todayStrPHT();
-  const todayRecord = attendance.find(r => r.employeeId === user.employeeId && r.date === todayStr);
-  const [showModal, setShowModal] = useState(false);
-
-  if (!todayRecord) return (
-    <div className="p-6"><div className="bg-card border border-border rounded-xl p-8 text-center text-muted-foreground text-sm">No check-in found for today. Please check in first.</div></div>
+  const todayRecord = attendance.find(r => r.employeeId === user.employeeId && r.date === todayStr); 
+  const [showModal, setShowModal] = useState(false); 
+  
+  if (!todayRecord) return ( 
+    <div className="flex flex-col items-center justify-center py-20 text-center space-y-4">
+      <div className="w-16 h-16 bg-secondary rounded-full flex items-center justify-center text-muted-foreground">
+        <LogOut size={24} />
+      </div>
+      <div>
+        <h2 className="text-lg font-bold">Not Checked In</h2>
+        <p className="text-sm text-muted-foreground">No check-in found for today. Please check in first.</p>
+      </div>
+    </div>
   );
 
   if (todayRecord.timeOut) return (
-    <div className="p-4 sm:p-6 max-w-lg">
-      <div className="bg-card border border-border rounded-xl p-5">
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 rounded-full bg-emerald-500/15 flex items-center justify-center"><CheckCheck size={18} className="text-emerald-400" /></div>
-          <div><p className="text-sm font-semibold text-foreground">Already Checked Out</p><p className="text-xs text-muted-foreground">{todayStr}</p></div>
+    <div className="flex flex-col items-center justify-center py-20 text-center space-y-4">
+      <div className="w-16 h-16 bg-emerald-500/10 rounded-full flex items-center justify-center text-emerald-400">
+        <CheckCircle2 size={24} />
+      </div>
+      <div>
+        <h2 className="text-lg font-bold">Already Checked Out</h2>
+        <p className="text-sm text-muted-foreground">Your attendance for {todayStr} is complete.</p>
+      </div>
+      <div className="bg-secondary/40 rounded-xl p-4 w-full max-w-xs text-left space-y-2">
+        <div className="flex justify-between">
+          <span className="text-xs text-muted-foreground">Time In</span>
+          <span className="text-xs font-bold">{todayRecord.timeIn}</span>
         </div>
-        <div className="grid grid-cols-3 gap-4 text-center">
-          <div><p className="text-[10px] font-mono text-muted-foreground uppercase">Time In</p><p className="text-sm font-bold text-foreground mt-1">{todayRecord.timeIn}</p></div>
-          <div><p className="text-[10px] font-mono text-muted-foreground uppercase">Time Out</p><p className="text-sm font-bold text-foreground mt-1">{todayRecord.timeOut}</p></div>
-          <div><p className="text-[10px] font-mono text-muted-foreground uppercase">Total Hrs</p><p className="text-sm font-bold text-primary mt-1">{todayRecord.totalHours}h</p></div>
+        <div className="flex justify-between">
+          <span className="text-xs text-muted-foreground">Time Out</span>
+          <span className="text-xs font-bold">{todayRecord.timeOut}</span>
+        </div>
+        <div className="flex justify-between pt-2 border-t border-border">
+          <span className="text-xs font-medium">Total Hrs</span>
+          <span className="text-xs font-bold text-primary">{todayRecord.totalHours}h</span>
         </div>
       </div>
     </div>
-  );
-
-  return (
-    <div className="p-4 sm:p-6 max-w-md">
-      <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-        <div>
-          <h2 className="text-sm font-semibold text-foreground">Check Out</h2>
-          <p className="text-xs text-muted-foreground mt-0.5">Verify your identity to record check-out time</p>
+  ); 
+  
+  return ( 
+    <div className="space-y-6 max-w-md mx-auto">
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight">Check Out</h1>
+        <p className="text-sm text-muted-foreground">Verify your identity and location to record check-out time.</p>
+      </div>
+      
+      <div className="bg-card border border-border rounded-xl p-5 space-y-4 shadow-sm">
+        <div className="flex items-center justify-between pb-4 border-b border-border">
+          <div>
+            <div className="text-[10px] font-mono text-muted-foreground mb-1">CHECKED IN</div>
+            <div className="text-xl font-bold">{todayRecord.timeIn}</div>
+          </div>
+          <div className="text-right">
+            <div className="text-[10px] font-mono text-muted-foreground mb-1">STATUS</div>
+            <StatusBadge status={todayRecord.status} />
+          </div>
         </div>
-        <div className="grid grid-cols-3 gap-3 text-center py-3 border-y border-border">
-          <div><p className="text-[10px] font-mono text-muted-foreground">CHECKED IN</p><p className="text-sm font-bold text-foreground mt-1">{todayRecord.timeIn}</p></div>
-          <div><p className="text-[10px] font-mono text-muted-foreground">STATUS</p><div className="mt-1"><StatusBadge status={todayRecord.status} /></div></div>
-          <div><p className="text-[10px] font-mono text-muted-foreground">AUTH</p><p className="text-[10px] text-muted-foreground mt-1 truncate">{todayRecord.authMethod}</p></div>
+        <div className="text-xs text-muted-foreground">
+          <span className="font-semibold text-foreground">AUTH</span> • {todayRecord.authMethod}
         </div>
-        <button onClick={() => setShowModal(true)}
-          className="w-full flex items-center justify-center gap-2 bg-red-500/15 border border-red-500/30 text-red-400 rounded-xl py-3 text-sm font-semibold hover:bg-red-500/25 active:scale-[0.99] transition-all">
-          <LogOut size={15} /> Check Out Now
+        <button onClick={() => setShowModal(true)} className="w-full flex items-center justify-center gap-2 bg-red-500/15 border border-red-500/30 text-red-400 rounded-xl py-3 text-sm font-semibold hover:bg-red-500/25 active:scale-[0.99] transition-all">
+          <LogOut size={16} /> Check Out Now
         </button>
       </div>
-      {showModal && (
-        <CheckOutModal user={user} todayRecord={todayRecord}
-          onComplete={(updated) => { onUpdate(attendance.map(r => r.id === todayRecord.id ? updated : r)); setShowModal(false); }}
-          onClose={() => setShowModal(false)} />
+
+      {showModal && ( 
+        <CheckOutModal 
+          user={user} 
+          geofences={geofences}
+          todayRecord={todayRecord} 
+          onComplete={(updated) => { 
+            onUpdate(attendance.map(r => r.id === todayRecord.id ? updated : r)); 
+            setShowModal(false); 
+          }} 
+          onClose={() => setShowModal(false)} 
+        /> 
       )}
     </div>
-  );
+  ); 
 }
 
 // ─── Attendance History Page ──────────────────────────────────────────────────
@@ -4617,15 +4877,18 @@ export default function App() {
   };
 
   function renderPage() {
-    if (user!.role === "employee") {
-      if (page === "dashboard") return <EmployeeDashboard user={user!} attendance={attendance} onNavigateTo={setPage} />;
-      if (page === "checkout") return <CheckOutPage user={user!} attendance={attendance} onUpdate={setAttendance} />;
-      if (page === "history") return <AttendanceHistoryPage attendance={attendance} employeeId={user!.employeeId} />;
-      if (page === "schedule") return <SchedulePage user={user!} />;
-      if (page === "profile") return <ProfilePage user={user!} employees={employees} accounts={accounts} onUpdatePassword={handleUpdatePassword} />;
+    // Explicit Type Guard: Tells TypeScript 'user' is definitively NOT null below this line
+    if (!user) return null;
+
+    if (user.role === "employee") {
+      if (page === "dashboard") return <EmployeeDashboard user={user} attendance={attendance} onNavigateTo={setPage} />;
+      if (page === "checkout") return <CheckOutPage user={user} attendance={attendance} geofences={geofences} onUpdate={setAttendance} />;
+      if (page === "history") return <AttendanceHistoryPage attendance={attendance} employeeId={user.employeeId} />;
+      if (page === "schedule") return <SchedulePage user={user} />;
+      if (page === "profile") return <ProfilePage user={user} employees={employees} accounts={accounts} onUpdatePassword={handleUpdatePassword} />;
     } else {
       if (page === "dashboard") return <AdminDashboard employees={employees} attendance={attendance} onNavigate={setPage} onUpdateOT={handleUpdateOT} />;
-      if (page === "employees") return <AdminEmployeesPage employees={employees} onUpdate={setEmployees} onAddAuditLog={addAuditLog} adminUser={user!} />;
+      if (page === "employees") return <AdminEmployeesPage employees={employees} onUpdate={setEmployees} onAddAuditLog={addAuditLog} adminUser={user} />;
       if (page === "attendance") return <AttendanceHistoryPage attendance={attendance} isAdmin onUpdateOT={handleUpdateOT} />;
       if (page === "holidays") return <HolidaysPage holidays={holidays} onUpdate={setHolidays} />;
       if (page === "payroll") return <PayrollPage employees={employees} attendance={attendance} />;
